@@ -110,7 +110,205 @@ Amplitude_Constraint = np.sqrt(FROG_Trace_Clean + np.finfo(float).eps)  # 防止
 use_real_data = 1  # 修改此值来选择数据源：0=模拟数据，1=真实数据
 
 if use_real_data == 1:
-    pass
+    # 使用真实实验数据
+    print('========== 使用真实实验数据 ==========')
+    
+    # 数据加载
+    data_file = 'frog_data1 2.xlsx'
+    print(f'正在读取数据文件: {data_file}')
+    raw = pd.read_excel(data_file, header=None).values.astype(float)
+    # 提取数据
+    baseline = raw[1:, 0]           # Nλ×1，第1列从第2行开始作为背景强度基线数据
+    lambda_nm_raw = raw[1:, 1]      # Nλ×1，第2列从第2行开始作为波长 λ (nm)
+    tau_fs_raw = raw[0, 2:]         # 1×Nt，第1行从第3列开始作为延迟 τ (fs)
+    intensity = raw[1:, 2:]         # Nλ×Nt，原始实验数据
+    intensity = intensity - baseline[:, np.newaxis]  # 减去基线
+    
+    # 数据处理：去除NaN/Inf
+    mask_t = np.isfinite(tau_fs_raw)
+    mask_l = np.isfinite(lambda_nm_raw)
+    tau_fs = tau_fs_raw[mask_t]
+    lambda_nm = lambda_nm_raw[mask_l]
+    I_exp_lambda = intensity[np.ix_(mask_l, mask_t)]
+    I_exp_lambda[~np.isfinite(I_exp_lambda)] = 0
+    
+    # 确保数据按升序排序（interp2d要求）
+    # 对tau排序
+    idx_tau = np.argsort(tau_fs)
+    tau_fs = tau_fs[idx_tau]
+    I_exp_lambda = I_exp_lambda[:, idx_tau]
+    
+    # 对lambda排序（通常lambda是降序的，需要转换为升序）
+    idx_lambda = np.argsort(lambda_nm)
+    lambda_nm = lambda_nm[idx_lambda]
+    I_exp_lambda = I_exp_lambda[idx_lambda, :]
+    
+    # 数据尺寸
+    Nlambda, Nt = I_exp_lambda.shape
+    print(f'原始数据尺寸: Nλ = {Nlambda}, Nt = {Nt}')
+    
+    # 设置目标网格大小（2的幂，便于FFT）
+    N = 512  # 可根据需要调整：512, 1024, 2048等
+    print(f'目标网格大小: N = {N} × {N}')
+    
+    # 计算时间窗口和频率参数
+    # 从原始数据估计时间窗口
+    tau_range = np.max(tau_fs) - np.min(tau_fs)
+    T_window = tau_range * 1.2  # 稍微扩大窗口以包含所有数据
+    dt = T_window / N
+    t = np.arange(-N/2, N/2) * dt  # 时间轴
+    
+    # 频率轴设置
+    d_omega = 2 * np.pi / (N * dt)
+    omega = np.arange(-N/2, N/2) * d_omega  # 角频率轴 (rad/fs)
+    
+    # 从原始数据估计中心波长（使用强度加权平均）
+    lambda_center_est = np.sum(lambda_nm * np.sum(I_exp_lambda, axis=1)) / np.sum(I_exp_lambda)
+    lambda_center = lambda_center_est  # 使用估计的中心波长
+    c_const = 300  # 光速 (nm/fs)
+    omega_0 = 2 * np.pi * c_const / lambda_center  # 中心载波频率
+    
+    print(f'估计的中心波长: {lambda_center:.2f} nm')
+    
+    # 将lambda转换为角频率（对于SHG FROG，信号频率是基频的2倍）
+    # SHG信号的频率：omega_SHG = 2*omega_0 + omega_offset
+    # 从lambda计算频率：omega_SHG = 2*pi*c/lambda
+    omega_SHG_raw = 2 * np.pi * c_const / lambda_nm  # SHG信号的角频率
+    
+    # 创建重采样网格
+    # 对于SHG FROG，FROG痕迹在频域对应SHG信号的频率
+    # 但在PCGPA算法中，我们计算E_sig(t, tau)的FFT得到Sig(omega, tau)
+    # 其中omega是相对于0的角频率
+    # 对于SHG，信号频率是基频的2倍，所以Sig(omega, tau)在2*omega_0附近有能量
+    # 因此，我们需要将omega_SHG转换为相对于0的omega
+    omega_SHG_center = 2 * omega_0  # SHG中心频率
+    omega_range = omega_SHG_raw - omega_SHG_center  # 相对于SHG中心的偏移，这就是相对于0的omega
+    
+    # 去除NaN/Inf值（如果存在）
+    valid_omega_idx = np.isfinite(omega_range)
+    if np.sum(valid_omega_idx) < len(omega_range):
+        print(f'警告：发现 {np.sum(~valid_omega_idx)} 个非有限值，已去除')
+        omega_range = omega_range[valid_omega_idx]
+        I_exp_lambda = I_exp_lambda[valid_omega_idx, :]
+    
+    # 确保omega_range按升序排序
+    # 由于lambda_nm已升序，omega_SHG_raw是降序的（频率与波长成反比）
+    # 所以omega_range = omega_SHG_raw - omega_SHG_center也是降序的
+    # 需要反转顺序以使其升序
+    if omega_range[0] > omega_range[-1]:
+        omega_range = np.flipud(omega_range)
+        I_exp_lambda = np.flipud(I_exp_lambda)
+    
+    # 去除重复值（如果存在），保持单调性
+    omega_range, unique_idx = np.unique(omega_range, return_index=True)
+    I_exp_lambda = I_exp_lambda[unique_idx, :]
+    
+    # 最终确保严格单调递增（如果仍有问题，进行显式排序）
+    if not np.all(np.diff(omega_range) > 0):
+        print('警告：omega_range不是严格单调递增，正在进行显式排序...')
+        sort_idx = np.argsort(omega_range)
+        omega_range = omega_range[sort_idx]
+        I_exp_lambda = I_exp_lambda[sort_idx, :]
+    
+    # 创建均匀的tau网格
+    tau_min = np.min(tau_fs)
+    tau_max = np.max(tau_fs)
+    tau_range_expanded = (tau_max - tau_min) * 1.1
+    tau_center = (tau_max + tau_min) / 2
+    tau_target = np.linspace(tau_center - tau_range_expanded/2, tau_center + tau_range_expanded/2, N)
+    
+    # 使用插值重采样到N×N网格
+    # 注意：omega已经在前面定义，是相对于0的角频率轴
+    # omega_range是原始数据相对于SHG中心的偏移，也是相对于0的omega
+    print(f'正在重采样数据到 {N} × {N} 网格...')
+    
+    # 最终验证数据是否已排序（interp2d要求输入向量必须单调递增）
+    # 注意：排序已在前面完成，这里只做验证
+    if not np.all(np.diff(tau_fs) > 0):
+        raise ValueError(f'tau_fs排序失败，请检查数据。当前范围: [{np.min(tau_fs):.6f}, {np.max(tau_fs):.6f}]')
+    if not np.all(np.diff(omega_range) > 0):
+        raise ValueError(f'omega_range排序失败，请检查数据。当前范围: [{np.min(omega_range):.6f}, {np.max(omega_range):.6f}]')
+    
+    print(f'数据排序验证通过。tau范围: [{np.min(tau_fs):.2f}, {np.max(tau_fs):.2f}] fs, omega范围: [{np.min(omega_range):.4f}, {np.max(omega_range):.4f}] rad/fs')
+    
+    # 使用interp2d进行双线性插值
+    # 注意：interp2d的输入是 (x, y, z)，其中x是列（tau），y是行（omega）
+    # 但我们的数据是 I_exp_lambda[omega_idx, tau_idx]，即 [行=频率, 列=延迟]
+    print(f'插值前：I_exp_lambda尺寸 = [{I_exp_lambda.shape[0]}, {I_exp_lambda.shape[1]}], tau_fs长度 = {len(tau_fs)}, omega_range长度 = {len(omega_range)}')
+    print(f'查询点：tau_target长度 = {len(tau_target)}, omega长度 = {len(omega)}, N = {N}')
+    
+    # 使用scipy.interpolate.griddata进行插值（更灵活）
+    tau_grid, omega_grid = np.meshgrid(tau_fs, omega_range)
+    points = np.column_stack((tau_grid.ravel(), omega_grid.ravel()))
+    values = I_exp_lambda.ravel()
+    query_points = np.column_stack((np.tile(tau_target, len(omega)), np.repeat(omega, len(tau_target))))
+    FROG_Trace_Exp = griddata(points, values, query_points, method='linear', fill_value=0)
+    FROG_Trace_Exp = FROG_Trace_Exp.reshape(len(omega), len(tau_target))
+    
+    # 检查输出尺寸
+    print(f'插值后：FROG_Trace_Exp尺寸 = [{FROG_Trace_Exp.shape[0]}, {FROG_Trace_Exp.shape[1]}]')
+    
+    # 确保输出是N×N
+    if FROG_Trace_Exp.shape[0] != N or FROG_Trace_Exp.shape[1] != N:
+        print(f'警告：FROG_Trace_Exp尺寸不匹配，期望[{N}, {N}]，实际[{FROG_Trace_Exp.shape[0]}, {FROG_Trace_Exp.shape[1]}]')
+        # 如果尺寸是N×N的转置，则转置
+        if FROG_Trace_Exp.shape[1] == N and FROG_Trace_Exp.shape[0] == N:
+            # 已经是N×N，但可能是转置的
+            # 检查是否需要转置（根据griddata，返回应该是len(omega) × len(tau_target)）
+            # 即N×N
+            if FROG_Trace_Exp.shape[0] == len(tau_target) and FROG_Trace_Exp.shape[1] == len(omega):
+                FROG_Trace_Exp = FROG_Trace_Exp.T
+                print('已转置FROG_Trace_Exp')
+        else:
+            # 使用resize调整尺寸
+            print('使用zoom调整尺寸...')
+            zoom_factors = (N / FROG_Trace_Exp.shape[0], N / FROG_Trace_Exp.shape[1])
+            FROG_Trace_Exp = zoom(FROG_Trace_Exp, zoom_factors, order=1)
+        print(f'调整后：FROG_Trace_Exp尺寸 = [{FROG_Trace_Exp.shape[0]}, {FROG_Trace_Exp.shape[1]}]')
+    
+    # 最终验证尺寸
+    if FROG_Trace_Exp.shape[0] != N or FROG_Trace_Exp.shape[1] != N:
+        raise ValueError(f'FROG_Trace_Exp最终尺寸不正确：期望[{N}, {N}]，实际[{FROG_Trace_Exp.shape[0]}, {FROG_Trace_Exp.shape[1]}]')
+    
+    # 数据清洗（与模拟数据相同的处理）
+    FROG_Trace_Clean = FROG_Trace_Exp.copy()
+    
+    # (a) 背景扣除：取四个角落的小块平均作为背景估计
+    corner_frac = 0.09
+    corner_sz = max(1, int(round(N * corner_frac)))
+    corners = np.concatenate([
+        FROG_Trace_Exp[0:corner_sz, 0:corner_sz].flatten(),
+        FROG_Trace_Exp[0:corner_sz, -corner_sz:].flatten(),
+        FROG_Trace_Exp[-corner_sz:, 0:corner_sz].flatten(),
+        FROG_Trace_Exp[-corner_sz:, -corner_sz:].flatten()
+    ])
+    bg_val = np.mean(corners)
+    FROG_Trace_Clean = FROG_Trace_Clean - bg_val
+    
+    # (b) 阈值处理
+    FROG_Trace_Clean[FROG_Trace_Clean < 0] = 0
+    threshold = 0.01 * np.max(FROG_Trace_Clean)
+    FROG_Trace_Clean[FROG_Trace_Clean < threshold] = 0
+    
+    # (c) 归一化与幅度约束
+    if np.max(FROG_Trace_Clean) > 0:
+        FROG_Trace_Clean = FROG_Trace_Clean / np.max(FROG_Trace_Clean)
+    Amplitude_Constraint = np.sqrt(FROG_Trace_Clean + np.finfo(float).eps)
+    
+    # 更新tau为新的网格
+    tau = tau_target
+    
+    # 注意：FROG_Trace_Clean的维度是[omega, tau]，这是频域的强度分布
+    # 在PCGPA算法中，我们计算E_sig(t, tau)的FFT得到Sig(omega, tau)
+    # 然后|Sig(omega, tau)|^2与FROG_Trace_Clean进行比较
+    # omega轴已经正确对应（相对于0的角频率）
+    
+    print('数据预处理完成。')
+    print(f'FROG痕迹尺寸: {FROG_Trace_Clean.shape[0]} × {FROG_Trace_Clean.shape[1]}')
+    
+    # 对于真实数据，没有真值用于对比
+    Et_true = None  # 标记没有真值
+    FWHM_true = np.nan  # 标记没有真值
     
 else:
     # 使用模拟数据（保留原始代码）
