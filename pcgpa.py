@@ -435,7 +435,7 @@ def plot_results(t_fs, f_exp_sorted, I_exp_sorted, Et_final, FROG_final_freq, fr
     print("===========================================================")
 
 
-def SHG_FROG_Reconstruction_Original_Grid():
+if __name__ == "__main__":
     """主函数：在原始测量网格上进行SHG-FROG重建"""
 
     # 1. 加载和预处理数据
@@ -447,7 +447,7 @@ def SHG_FROG_Reconstruction_Original_Grid():
 
     # 3. PCGPA重建
     Et_final, frog_err = pcgpa_reconstruction(t_fs, f_exp_sorted, I_exp_sorted,
-                                              Et_initial, dt_fs, max_iter=150)
+                                              Et_initial, dt_fs, max_iter=100)
 
     # 4. 计算最终FROG迹线
     FROG_final_freq = calculate_final_trace(Et_final, t_fs, dt_fs)
@@ -466,13 +466,4 @@ def SHG_FROG_Reconstruction_Original_Grid():
         'frog_err': frog_err,
         'FROG_final_freq': FROG_final_freq
     }
-
-    np.savez('frog_reconstruction_results_original_grid.npz', **results)
-    print("Results saved to frog_reconstruction_results_original_grid.npz")
-
-    return Et_final, frog_err
-
-
-# 运行主函数
-if __name__ == "__main__":
-    SHG_FROG_Reconstruction_Original_Grid()
+    print(results)
